@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Chave da OpenAI e segredos — NUNCA versionar
+.openai_api_key
+.env
+.env.*
+
+# Dados de uso do programa (ficam em ~/voicenote-cli, mas ignora se alguém rodar aqui dentro)
+fila/
+transcripts/
+processados/
+temp/
+*.m4a
+*.mp3
+*.wav
+*.webm
+
+# SO
+.DS_Store
+Thumbs.db

@@ -22,6 +22,7 @@ import subprocess
 import platform
 import shutil
 import os
+import re
 import sys
 import threading
 import time
@@ -170,16 +171,22 @@ def get_audio_files_from_queue() -> list[Path]:
 # DISPOSITIVOS E GRAVAÇÃO
 # =========================
 
-def list_audio_devices():
-    """Lista (best-effort) os dispositivos de entrada conforme o backend do SO."""
+def enumerate_audio_devices() -> list[tuple[str, str]]:
+    """Retorna [(token, nome)] dos dispositivos de entrada, conforme o backend.
+    Re-executa a listagem a cada chamada: a lista muda em tempo real (ex.: no
+    macOS o "Microsoft Teams Audio" aparece/some, reordenando os índices).
+    - avfoundation: token = índice ('0'); nome = rótulo do device.
+    - dshow: token = nome; nome = nome (o Windows já casa por nome).
+    - pulse/alsa: [] (não dá pra enumerar de forma confiável, e o token já é o
+      nome/'default', que não sofre reordenação)."""
     backend = audio_backend()
-    print("\nDispositivos de áudio disponíveis:\n")
 
     if backend == "avfoundation":
         result = subprocess.run(
             ["ffmpeg", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        devices = []
         show_audio = False
         for line in result.stderr.splitlines():
             if "AVFoundation audio devices:" in line:
@@ -188,19 +195,43 @@ def list_audio_devices():
             if show_audio:
                 if "Error opening input" in line:
                     break
-                if "] [" in line:
-                    print(line.split("] ", 1)[-1])
+                # formato: "[AVFoundation indev @ 0x...] [0] Nome do device"
+                match = re.search(r"\]\s*\[(\d+)\]\s*(.+)", line)
+                if match:
+                    devices.append((match.group(1), match.group(2).strip()))
+        return devices
 
-    elif backend == "dshow":
+    if backend == "dshow":
         result = subprocess.run(
             ["ffmpeg", "-list_devices", "true", "-f", "dshow", "-i", "dummy"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
+        devices = []
         for line in result.stderr.splitlines():
             if "(audio)" in line and '"' in line:
                 name = line.split('"')[1]
-                print(f'  {name}')
-        print("\n(Use o nome EXATO entre aspas como dispositivo.)")
+                devices.append((name, name))
+        return devices
+
+    # pulse / alsa
+    return []
+
+
+def list_audio_devices():
+    """Lista (best-effort) os dispositivos de entrada conforme o backend do SO."""
+    backend = audio_backend()
+    print("\nDispositivos de áudio disponíveis:\n")
+
+    if backend in ("avfoundation", "dshow"):
+        # fonte única de parsing (ver enumerate_audio_devices)
+        devices = enumerate_audio_devices()
+        if devices:
+            for token, name in devices:
+                print(f"  [{token}] {name}" if backend == "avfoundation" else f"  {name}")
+        else:
+            print("  (não foi possível listar)")
+        if backend == "dshow":
+            print("\n(Use o nome EXATO entre aspas como dispositivo.)")
 
     elif backend in ("pulse", "alsa"):
         # Tenta listar via ffmpeg -sources; se não rolar, instrui o "default".
@@ -217,20 +248,51 @@ def list_audio_devices():
     print()
 
 
-def choose_audio_device() -> str:
-    """Pergunta o dispositivo conforme o backend. Retorna o TOKEN cru (índice/nome/source)."""
+def choose_audio_device() -> tuple[str, str]:
+    """Pergunta o dispositivo conforme o backend. Retorna (token, nome_legível).
+    O token vai pro ffmpeg; o NOME é o que guardamos pra re-achar o device se a
+    lista de entrada reordenar entre gravações (ver resolve_audio_device)."""
     backend = audio_backend()
-    list_audio_devices()
 
     if backend == "avfoundation":
-        return input("Digite o número do microfone que deseja usar [0]: ").strip() or "0"
+        devices = enumerate_audio_devices()
+        print("\nDispositivos de áudio disponíveis:\n")
+        if devices:
+            for index, name in devices:
+                print(f"  [{index}] {name}")
+        else:
+            print("  (não foi possível listar — tente o índice 0)")
+        print()
+        index = input("Digite o número do microfone que deseja usar [0]: ").strip() or "0"
+        name = next((n for i, n in devices if i == index), None) or f"índice {index}"
+        return index, name
+
     if backend == "dshow":
+        list_audio_devices()
         name = input("Digite o NOME EXATO do dispositivo de áudio: ").strip()
         while not name:
             name = input("O Windows (dshow) exige o nome exato. Digite o dispositivo: ").strip()
-        return name
+        return name, name
+
     # pulse / alsa
-    return input("Digite a fonte/dispositivo [default]: ").strip() or "default"
+    list_audio_devices()
+    token = input("Digite a fonte/dispositivo [default]: ").strip() or "default"
+    return token, token
+
+
+def resolve_audio_device(name: str, previous_token: str) -> str | None:
+    """Re-enumera e devolve o token atual do dispositivo chamado `name`.
+    - avfoundation/dshow: acha pelo nome (o índice do avfoundation muda em tempo real).
+    - Lista vazia (pulse/alsa, ou falha ao listar): devolve o token anterior — não trava,
+      pois nesses casos o token já é o nome/'default', que não sofre reordenação.
+    - Enumerou mas o device sumiu: None (o chamador re-pergunta)."""
+    devices = enumerate_audio_devices()
+    if not devices:
+        return previous_token
+    for token, dev_name in devices:
+        if dev_name == name:
+            return token
+    return None
 
 
 def record_audio(audio_device: str) -> Path:
@@ -550,9 +612,21 @@ def process_single_audio(client: OpenAI, audio_path: Path, show_transcript: bool
 # =========================
 
 def record_and_transcribe_flow(client: OpenAI):
-    audio_device = choose_audio_device()
+    audio_device, device_name = choose_audio_device()
 
     while True:
+        # A lista de dispositivos pode mudar em tempo real (no macOS o índice
+        # reordena quando um device aparece/some). Antes de CADA gravação, re-acha
+        # o device pelo nome pra não gravar da fonte errada (gravação sairia muda).
+        resolved = resolve_audio_device(device_name, audio_device)
+        if resolved is None:
+            print(f'\n⚠️  O dispositivo "{device_name}" não está mais na lista.')
+            print("A lista mudou ou ele foi desconectado. Escolha de novo:")
+            audio_device, device_name = choose_audio_device()
+        elif resolved != audio_device:
+            print(f'\nℹ️  A lista mudou; "{device_name}" agora é [{resolved}]. Ajustado automaticamente.')
+            audio_device = resolved
+
         audio_path = record_audio(audio_device)
 
         answer = input("\nDeseja transcrever agora? [s/n]: ").strip().lower()
