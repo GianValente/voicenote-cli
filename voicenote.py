@@ -51,6 +51,23 @@ CHUNK_SECONDS = 6 * 60
 SILENCE_THRESHOLD_DB = -45
 SILENCE_WARNING_SECONDS = 10
 
+# Corte no silêncio (emendas limpas). Cortar em 6:00 cravados cai no meio de uma palavra:
+# o modelo recebe meia palavra em cada ponta e "completa" o fragmento — sai palavra inventada,
+# palavra perdida ou frase duplicada, uma vez por emenda. Aqui o ponto de corte é empurrado
+# pro silêncio mais próximo do alvo, dentro de uma janela.
+# O limiar de silêncio NÃO é fixo (um valor cravado ou não acha pausa nenhuma ou marca o áudio
+# inteiro) e também NÃO dá pra deduzir do volume médio: medindo 12 gravações reais, o piso de
+# ruído variou de -50 a -35 dB SEM acompanhar a média — a gravação mais alta (média -25 dB) tinha
+# o piso mais baixo. Por isso o limiar é PROCURADO: começa estrito e afrouxa até as pausas
+# aparecerem. Cada passe é só análise (~1 s num áudio de 15 min), então a busca é barata.
+CUT_SILENCE_BELOW_MEAN_DB = 20   # ponto de PARTIDA da busca: 20 dB abaixo do volume médio
+CUT_SILENCE_DB_RANGE = (-50, -20)  # ...limitado a esta faixa, pra não degenerar nos extremos
+CUT_SILENCE_DB_STEP = 5          # de quanto em quanto afrouxa quando não aparece pausa
+CUT_SILENCE_DB_CEILING = -30     # teto da busca: acima disso, fala baixa já conta como silêncio
+CUT_SILENCE_MIN_SECONDS = 0.2    # a pausa entre duas palavras já basta pra emendar limpo
+CUT_SEARCH_WINDOW = 45           # o quanto o corte pode andar pra achar silêncio (±s)
+CUT_MIN_CHUNK_SECONDS = 60       # nenhuma parte menor que isso (evita rabinho inútil)
+
 TRANSCRIPTION_PROMPT = """
 Transcrição em português brasileiro.
 A fala pode ser espontânea, com vícios de linguagem como "né", "tipo", "enfim".
@@ -165,6 +182,42 @@ def get_audio_files_from_queue() -> list[Path]:
     for ext in SUPPORTED_EXTENSIONS:
         files.extend(FILA_DIR.glob(f"*{ext}"))
     return sorted(files)
+
+
+def flush_input_buffer():
+    """Descarta o que ficou digitado no buffer do teclado.
+    Tecla batida por engano enquanto o ffmpeg encerra o arquivo fica pendurada no
+    buffer e é lida pela PRÓXIMA pergunta: o 's' de "transcrever agora" virava
+    "\\s", que não bate com nada e caía no "não" sem avisar."""
+    if not sys.stdin.isatty():
+        return
+    try:
+        if SYSTEM == "Windows":
+            import msvcrt
+            while msvcrt.kbhit():
+                msvcrt.getch()
+        else:
+            import termios
+            termios.tcflush(sys.stdin, termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def ask_yes_no(prompt: str) -> bool:
+    """Pergunta s/n limpando o buffer antes e PERGUNTANDO DE NOVO se não entender.
+    Resposta desconhecida nunca vira "não" calado — isso já custou transcrição."""
+    flush_input_buffer()
+
+    while True:
+        answer = input(prompt).strip().lower()
+
+        if answer in ["", "s", "sim", "y", "yes"]:
+            return True
+
+        if answer in ["n", "nao", "não", "no"]:
+            return False
+
+        print(f'Não entendi "{answer}". Responda s (sim) ou n (não).')
 
 
 # =========================
@@ -402,6 +455,8 @@ def record_audio(audio_device: str) -> Path:
     timer_thread = threading.Thread(target=show_timer_and_audio_feedback, daemon=True)
     timer_thread.start()
 
+    # Tecla batida antes daqui não pode encerrar a gravação recém-começada.
+    flush_input_buffer()
     input()
 
     recording = False
@@ -426,6 +481,117 @@ def record_audio(audio_device: str) -> Path:
 # FATIAMENTO
 # =========================
 
+def silence_threshold_db(audio_path: Path) -> float:
+    """Limiar de silêncio em dB, derivado do volume médio da própria gravação.
+    Cai no meio da faixa se o ffmpeg não reportar a média."""
+    floor_db, ceil_db = CUT_SILENCE_DB_RANGE
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostats", "-i", str(audio_path),
+             "-af", "volumedetect", "-f", "null", "-"],
+            capture_output=True, text=True,
+        )
+        for line in result.stderr.splitlines():
+            if "mean_volume:" in line:
+                mean = float(line.split("mean_volume:")[1].split()[0])
+                return max(floor_db, min(ceil_db, mean - CUT_SILENCE_BELOW_MEAN_DB))
+    except (OSError, ValueError, IndexError):
+        pass
+    return (floor_db + ceil_db) / 2
+
+
+def detect_silences(audio_path: Path, threshold_db: float) -> list[tuple[float, float]]:
+    """Trechos de silêncio (início, fim) em segundos, pelo filtro silencedetect do ffmpeg.
+
+    É um passe de análise: não reencoda nada (saída vai pro /dev/null), só lê o áudio.
+    Retorna [] em qualquer falha — aí o fatiamento cai no corte por tempo fixo."""
+    command = [
+        "ffmpeg", "-hide_banner", "-nostats",
+        "-i", str(audio_path),
+        "-af", f"silencedetect=noise={threshold_db}dB:d={CUT_SILENCE_MIN_SECONDS}",
+        "-f", "null", "-",
+    ]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True)
+    except OSError:
+        return []
+
+    # o filtro escreve no stderr: "... silence_start: 12.34" / "... silence_end: 13.02 | ..."
+    silences: list[tuple[float, float]] = []
+    start: float | None = None
+    for line in result.stderr.splitlines():
+        try:
+            if "silence_start:" in line:
+                start = float(line.split("silence_start:")[1].split()[0])
+            elif "silence_end:" in line and start is not None:
+                silences.append((start, float(line.split("silence_end:")[1].split()[0])))
+                start = None
+        except (ValueError, IndexError):
+            start = None  # linha estranha: ignora o par e segue
+    return silences
+
+
+def cut_points(duration: float, silences: list[tuple[float, float]]) -> tuple[list[float], int]:
+    """Onde cortar: a cada ~CHUNK_SECONDS, deslocando pro MEIO do silêncio mais próximo.
+
+    Cada alvo é medido a partir do corte anterior (e não do relógio do arquivo), pra um
+    deslocamento não encurtar a parte seguinte. Sem silêncio na janela, corta no alvo —
+    o comportamento antigo, que continua valendo pra áudio sem nenhuma pausa.
+
+    Devolve (pontos, quantos caíram em pausa). O segundo número existe porque sem ele quem
+    chama não distingue "3 cortes no silêncio" de "3 cortes no relógio": os dois voltam como
+    uma lista de 3 pontos. Era o que fazia o CLI anunciar corte no silêncio sem ter achado um."""
+    points: list[float] = []
+    silence_hits = 0
+    target = CHUNK_SECONDS
+    while target < duration - CUT_MIN_CHUNK_SECONDS:
+        previous = points[-1] if points else 0.0
+        best: float | None = None
+        for silence_start, silence_end in silences:
+            middle = (silence_start + silence_end) / 2
+            if abs(middle - target) > CUT_SEARCH_WINDOW:
+                continue
+            if middle - previous < CUT_MIN_CHUNK_SECONDS:
+                continue
+            if best is None or abs(middle - target) < abs(best - target):
+                best = middle
+        point = best if best is not None else target
+        if best is not None:
+            silence_hits += 1
+        points.append(point)
+        target = point + CHUNK_SECONDS
+    return points, silence_hits
+
+
+def plan_cuts(audio_path: Path, duration: float) -> tuple[list[float], int, float]:
+    """Pontos de corte, afrouxando o limiar de silêncio até as pausas aparecerem.
+
+    O limiar derivado do volume médio erra feio em gravação de microfone real: em 12 gravações
+    longas do uso diário (ago/2026) ele achou pausa em UMA — nas outras 11 o fatiamento caía
+    calado no corte por tempo, justamente o que o corte no silêncio existe pra evitar.
+    Aqui o piso de ruído é procurado, não chutado: parte do limiar derivado (o mais estrito) e
+    afrouxa de CUT_SILENCE_DB_STEP em CUT_SILENCE_DB_STEP até TODO corte cair numa pausa.
+    Para no primeiro limiar que cobre tudo — o mais estrito que serve, o que menos arrisca
+    confundir fala baixa com silêncio — e nunca passa de CUT_SILENCE_DB_CEILING.
+    Devolve (pontos, quantos em pausa, limiar usado)."""
+    threshold = silence_threshold_db(audio_path)
+    best: tuple[list[float], int, float] = ([], -1, threshold)
+
+    while True:
+        points, hits = cut_points(duration, detect_silences(audio_path, threshold))
+
+        if hits > best[1]:
+            best = (points, hits, threshold)
+
+        if hits == len(points) or threshold >= CUT_SILENCE_DB_CEILING:
+            break
+
+        threshold = min(threshold + CUT_SILENCE_DB_STEP, CUT_SILENCE_DB_CEILING)
+
+    points, hits, threshold = best
+    return points, max(hits, 0), threshold
+
+
 def split_audio(audio_path: Path) -> list[Path]:
     print("\nÁudio longo detectado.")
     print("Fatiando em partes menores para não perder o final...")
@@ -435,12 +601,30 @@ def split_audio(audio_path: Path) -> list[Path]:
 
     output_pattern = chunk_folder / f"{safe_stem(audio_path)}_parte_%03d.m4a"
 
+    # Escolhe os pontos de corte no silêncio pra não partir palavra ao meio (ver constantes).
+    duration = audio_duration_seconds(audio_path)
+    points, silence_hits, threshold = plan_cuts(audio_path, duration) if duration else ([], 0, 0.0)
+
+    if silence_hits:
+        # A mensagem diz quantos cortes caíram em pausa DE VERDADE — o resto caiu no relógio.
+        if silence_hits == len(points):
+            print(f"Cortando em {silence_hits} pausa(s) da fala (silêncio abaixo de "
+                  f"{threshold:.0f} dB), para não partir palavras.")
+        else:
+            print(f"Cortando em {len(points)} ponto(s): {silence_hits} em pausa da fala, "
+                  f"{len(points) - silence_hits} no tempo (sem pausa por perto).")
+        segment_args = ["-segment_times", ",".join(f"{p:.3f}" for p in points)]
+    else:
+        # sem duração legível ou sem nenhuma pausa detectada: corte por tempo fixo (como antes)
+        print("Nenhuma pausa utilizável encontrada — cortando por tempo.")
+        segment_args = ["-segment_time", str(CHUNK_SECONDS)]
+
     command = [
         "ffmpeg",
         "-y",
         "-i", str(audio_path),
         "-f", "segment",
-        "-segment_time", str(CHUNK_SECONDS),
+        *segment_args,
         # -reset_timestamps 1: cada parte recomeça em 0 e reporta a SUA duração real.
         # Sem isso, os pedaços herdam a duração do arquivo inteiro e o modelo trunca igual.
         "-reset_timestamps", "1",
@@ -629,15 +813,14 @@ def record_and_transcribe_flow(client: OpenAI):
 
         audio_path = record_audio(audio_device)
 
-        answer = input("\nDeseja transcrever agora? [s/n]: ").strip().lower()
-
-        if answer in ["s", "sim", ""]:
+        if ask_yes_no("\nDeseja transcrever agora? [s/n]: "):
             process_single_audio(client, audio_path, show_transcript=True)
         else:
             print("\nBeleza. O áudio ficou salvo em:")
             print(audio_path)
             print("Você pode transcrever depois pela opção 2 do menu.")
 
+        flush_input_buffer()
         next_action = input(
             "\nO que deseja fazer agora?\n"
             "1. Gravar outro áudio com o mesmo microfone\n"
@@ -675,9 +858,7 @@ def transcribe_queue_flow(client: OpenAI):
         print(f"{index}. {audio_path.name} ({file_size_mb(audio_path):.2f} MB)")
 
     print("\nO script vai transcrever todos os arquivos listados.")
-    answer = input("Deseja continuar? [s/n]: ").strip().lower()
-
-    if answer not in ["s", "sim", ""]:
+    if not ask_yes_no("Deseja continuar? [s/n]: "):
         print("\nOperação cancelada. Voltando ao menu principal.")
         return
 

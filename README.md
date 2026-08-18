@@ -46,10 +46,23 @@ cd ~/voicenote-cli
 ```
 > O programa usa `~/voicenote-cli` como base (cria `fila/`, `transcripts/`, `processados/`, `temp/`).
 
-**2. Dependência Python**
+**2. Dependência Python** — use um **ambiente virtual** (`venv`)
 ```bash
-pip3 install -r requirements.txt   # ou: pip3 install openai
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # ou: .venv/bin/pip install openai
 ```
+> **Por que venv e não `pip3 install` global:** o pacote `openai` traz extensões compiladas
+> (`pydantic_core`, `jiter`) que são específicas da arquitetura da máquina. Instalado no Python
+> global, ele se mistura com o que já estiver lá — e se aquele Python um dia passar a rodar em
+> outra arquitetura, o import quebra com `incompatible architecture`, sem você ter mexido em nada.
+>
+> **Mac com Apple Silicon (M1/M2/M3…):** é onde isso mais morde. Se o seu Python foi usado
+> **sob Rosetta** em algum momento, os pacotes ficaram em `x86_64`; ao rodar nativo (`arm64`) o
+> programa morre em `ImportError: dlopen(... _pydantic_core ...) incompatible architecture`.
+> O `venv` isola o CLI desse histórico. Pra conferir qual arquitetura você tem:
+> ```bash
+> .venv/bin/python -c "import platform; print(platform.machine())"   # arm64 ou x86_64
+> ```
 
 **3. ffmpeg**
 - macOS: `brew install ffmpeg`
@@ -90,7 +103,7 @@ Adicione no `~/.zshrc` (ou `~/.bashrc`):
 function voicenote() {
   export OPENAI_API_KEY="$(cat ~/.openai_api_key)"
   cd ~/voicenote-cli || return
-  python3 voicenote.py
+  .venv/bin/python voicenote.py
 }
 ```
 Recarregue: `source ~/.zshrc`
@@ -102,8 +115,10 @@ voicenote
 
 Sem alias:
 ```bash
-cd ~/voicenote-cli && export OPENAI_API_KEY="$(cat ~/.openai_api_key)" && python3 voicenote.py
+cd ~/voicenote-cli && export OPENAI_API_KEY="$(cat ~/.openai_api_key)" && .venv/bin/python voicenote.py
 ```
+> Use sempre o `.venv/bin/python` (não o `python3` do sistema) — é ele que enxerga o `openai`
+> instalado no passo 2. Se o seu alias usa `python3`, troque por `.venv/bin/python`.
 
 ---
 
@@ -120,7 +135,7 @@ VOICENOTE CLI
 ```
 - **Gravar:** escolhe o microfone, grava, **ENTER** encerra; transcreve e devolve o texto (copiado pro clipboard no macOS + salvo em `transcripts/*.md`).
 - **Fila:** joga arquivos de áudio em `fila/` e transcreve todos de uma vez.
-- **Áudio longo:** é fatiado por duração (~6 min/pedaço), transcrito em partes e juntado na ordem — não perde o final.
+- **Áudio longo:** é fatiado em pedaços de ~6 min, transcrito em partes e juntado na ordem — não perde o final. **O corte cai numa pausa da fala, não no relógio:** o programa procura o silêncio mais próximo do alvo (dentro de ±45 s) e corta ali. Cortar em 6:00 cravados parte uma palavra ao meio, e o modelo "completa" o fragmento — sai palavra inventada, trecho perdido ou frase repetida, uma vez por emenda. O limiar de silêncio é **medido no seu áudio**, não fixo (mic e ambiente mudam o que é "silêncio"). Se não houver pausa alguma na janela, aquele corte cai no tempo — e o programa **avisa** quantos cortes foram em pausa e quantos no relógio.
 
 Formatos aceitos: `.m4a .mp3 .wav .mp4 .mpeg .mpga .webm`.
 
