@@ -95,6 +95,33 @@ O programa lê a chave da variável de ambiente `OPENAI_API_KEY` (o alias abaixo
 
 ---
 
+## Atualizar
+
+**Sempre as duas linhas, nunca só a primeira:**
+
+```bash
+cd ~/voicenote-cli && git pull && .venv/bin/pip install -r requirements.txt
+```
+
+> ⚠️ **Por que o `pip install` não é opcional.** Quando uma versão traz dependência nova, quem
+> deu só `git pull` recebe um `ImportError` e conclui que o programa quebrou. Não quebrou: falta
+> instalar. É por isso que a documentação nunca mostra o `git pull` sozinho.
+
+Pra saber o que você está rodando:
+
+```bash
+.venv/bin/python voicenote.py --version
+```
+
+> Essa flag responde **antes** de carregar qualquer dependência — de propósito. Quem pergunta a
+> versão quase sempre está com um problema, e não faria sentido a resposta depender justamente
+> da parte que pode estar quebrada.
+
+O que mudou em cada versão está em [`CHANGELOG.md`](CHANGELOG.md). A regra de leitura é uma só:
+**número do meio muda = recurso novo, nada quebra. Primeiro número muda = você tem trabalho a fazer.**
+
+---
+
 ## Comando curto (alias)
 
 Adicione no `~/.zshrc` (ou `~/.bashrc`):

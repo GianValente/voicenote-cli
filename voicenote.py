@@ -15,6 +15,24 @@ Backend de áudio pode ser forçado via env VOICENOTE_AUDIO_BACKEND
 (avfoundation | pulse | alsa | dshow). Senão é deduzido do SO.
 """
 
+__version__ = "0.2.0"
+
+# 🔴 --version responde AQUI, antes de qualquer import pesado, e isso e a
+# diferenca entre a flag servir e nao servir. Quem pergunta a versao quase
+# sempre esta com um problema -- e o problema mais comum deste CLI e
+# justamente uma dependencia que nao carrega:
+#
+#   ImportError: ... _pydantic_core ... incompatible architecture
+#   (have 'x86_64', need 'arm64')
+#
+# Se a checagem morasse depois do `from openai import OpenAI`, a flag falharia
+# exatamente na hora em que e mais necessaria. Medido em 2026-09-10, tentando
+# rodar `--version` nesta maquina.
+import sys as _sys
+if "--version" in _sys.argv or "-V" in _sys.argv:
+    print(f"VoiceNote CLI {__version__}")
+    raise SystemExit(0)
+
 from pathlib import Path
 from datetime import datetime
 from openai import OpenAI
@@ -32,7 +50,53 @@ import time
 # CONFIGURAÇÕES
 # =========================
 
-BASE_DIR = Path.home() / "voicenote-cli"
+# Onde ficam os dados do usuário (fila, transcrições, áudios processados).
+#
+# ⚠️ POR QUE ISSO NÃO É `voicenote-cli`: a instrução de instalação clona o repositório
+# nessa pasta, então os dados nasceriam DENTRO da árvore de trabalho do git. O `.gitignore`
+# já evita que apareçam no `git status`, mas isso não cobre o pior caso: um `git clean -fdx`
+# — que é exatamente o que se digita quando alguém manda "limpa tudo e clona de novo" —
+# apaga arquivo IGNORADO junto, e aí vão as transcrições da pessoa. Fora isso, um arquivo
+# novo no repo com nome colidindo trava o `git pull` sem a pessoa entender por quê.
+#
+# Separar agora é uma linha. Depois de existir usuário, é migração com transcrição no meio.
+#
+# A ordem de resolução nunca surpreende quem já usa:
+#   1. $VOICENOTE_HOME, se definido
+#   2. ~/.voicenote, se já existir  → é pra onde quem migrou apontou
+#   3. a pasta antiga, se tiver dado dentro → segue funcionando, com um aviso de como mover
+#   4. ~/.voicenote (cria)
+LEGACY_BASE_DIR = Path.home() / "voicenote-cli"
+DEFAULT_BASE_DIR = Path.home() / ".voicenote"
+
+
+def resolve_base_dir() -> Path:
+    override = os.getenv("VOICENOTE_HOME")
+    if override:
+        return Path(override).expanduser()
+
+    if DEFAULT_BASE_DIR.exists():
+        return DEFAULT_BASE_DIR
+
+    tem_dado = any(
+        (LEGACY_BASE_DIR / nome).exists()
+        for nome in ("fila", "transcripts", "processados", "temp")
+    )
+    if tem_dado:
+        # O aviso só aparece onde o risco EXISTE: quando a pasta de dados é mesmo uma
+        # árvore de git (foi clonada ali). Numa instalação que só copiou o arquivo, não
+        # há `git clean` nem `git pull` pra estragar nada — e um banner diário numa
+        # ferramenta de uso constante vira ruído que a pessoa aprende a não ler.
+        if (LEGACY_BASE_DIR / ".git").exists():
+            print(f"⚠️  Seus dados estão dentro do clone do git ({LEGACY_BASE_DIR}).")
+            print(f"   Um `git clean -fdx` aí apaga transcrição junto. Pra separar:")
+            print(f"     mkdir -p {DEFAULT_BASE_DIR} && mv {LEGACY_BASE_DIR}/{{fila,transcripts,processados,temp}} {DEFAULT_BASE_DIR}/")
+        return LEGACY_BASE_DIR
+
+    return DEFAULT_BASE_DIR
+
+
+BASE_DIR = resolve_base_dir()
 
 FILA_DIR = BASE_DIR / "fila"
 TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
@@ -780,6 +844,11 @@ def process_single_audio(client: OpenAI, audio_path: Path, show_transcript: bool
         print(f"\nTranscrição salva em: {output_path}")
         print(f"Áudio movido para: {PROCESSADOS_DIR}")
         print("\nProcesso concluído.")
+
+        # 2ª camada: só depois de tudo acima estar garantido. Falha aqui não custa
+        # a transcrição, que já está salva, copiada e com o áudio arquivado.
+        if show_transcript:
+            offer_formatting(client, transcript, output_path)
         return True
 
     except Exception as error:
@@ -789,6 +858,220 @@ def process_single_audio(client: OpenAI, audio_path: Path, show_transcript: bool
         print("\nO áudio não foi movido para processados.")
         print(f"Arquivo preservado em: {audio_path}")
         return False
+
+
+# =========================
+# 2ª CAMADA — FORMATAÇÃO (D26, portado da web)
+# =========================
+# A tese está em docs/FORMATACAO_INTENCAO_E_LIMITES.md: a 2ª camada é TRANSPORTE,
+# NÃO AUTORIA. Ela muda a apresentação do que a pessoa disse pra caber num destino;
+# não muda o conteúdo. Por isso o controle é por DESTINO ("pra onde isso vai?") e não
+# por "formato": destino é um container com regras conhecidas, e molde aberto convida
+# o modelo a preencher — foi exatamente assim que, na web, o preset de e-mail passou a
+# inventar saudação e despedida.
+#
+# Três diferenças em relação à web, todas por causa do meio:
+#  1. o CLI roda com a chave do PRÓPRIO usuário → não há franquia a debitar;
+#  2. o clipboard É a entrega (o CLI existe pra colar em outro lugar), então o texto
+#     formatado toma o lugar do literal no clipboard — e isso é dito em voz alta;
+#  3. o literal continua no .md, intacto, e o formatado é ANEXADO embaixo — um arquivo
+#     por gravação, o literal sempre em cima.
+
+FORMAT_MODEL = "gpt-5.4-nano"
+
+# ⚠️ MOLDURA v3 — e a v2 (a que passou na web) REPROVOU aqui. Vale o registro porque a
+# causa é estrutural, não de redação:
+#   v1: o bloco de e-mail mandava "saudação, corpo, despedida" — instruía a inventar.
+#   v2: proibiu boilerplate e criou um "PASSO 1: se não couber, devolva limpo e PARE".
+#       Passou na web. No CLI, com fala vaga de 15 s, o modelo devolveu o texto limpo
+#       *com um "Assunto:" inventado em cima* — obedeceu os dois de uma vez.
+#   Diagnóstico: um prompt só não pode mandar APLICAR um formato e AO MESMO TEMPO decidir
+#   não aplicá-lo. O modelo racha a diferença, e o resultado é um híbrido que nenhum dos
+#   dois ramos pedia.
+#   v3: separa em DUAS chamadas — uma decide, a outra escreve. Cada uma com um trabalho só.
+#   É a mesma lição que a bancada de locutores deu no mesmo dia: decidir e reescrever são
+#   tarefas diferentes, e misturá-las degrada as duas. Custo: ~$0,0005 a mais por uso.
+
+DECISION_PROMPT = """Below is a speech transcript and a target format.
+
+Does the transcript have enough substance to become {rotulo} without you writing
+material the person did not say?
+
+Answer with one word: SIM or NAO.
+- SIM if the content carries the format on its own.
+- NAO if it is too short, too vague, or has nothing the format needs — in that case the
+  honest output is the transcript merely cleaned up, not an empty shell of the format.
+
+TRANSCRIPT:
+{transcricao}
+"""
+
+CLEANUP_PROMPT = """Clean up this speech transcript and output nothing else.
+
+- Remove filler words and false starts. Fix punctuation and capitalisation.
+- Change NOTHING else: no reordering, no summarising, no added words.
+- Do not add a title, a subject line, a greeting or a sign-off.
+- Write in the SAME language as the transcript.
+- Output only the cleaned text: no preamble, no explanation, no code fences.
+
+TRANSCRIPT:
+{transcricao}
+"""
+
+FORMAT_FRAME = """You rewrite a speech transcript. You never invent.
+
+RULES — these override everything below:
+- Use only what is in the transcript. Never add facts, names, numbers, dates or conclusions.
+- Keep proper nouns, technical terms and foreign words exactly as spoken.
+- Write in the SAME language as the transcript.
+- Never supply boilerplate the person did not speak: greetings, sign-offs, salutations
+  or closing formulas.
+- Output only the resulting text: no preamble, no explanation, no code fences, no "here is".
+
+TASK:
+{bloco}
+
+TRANSCRIPT:
+{transcricao}
+"""
+
+# (id do menu, rótulo, operação, instrução ao modelo)
+# "extrair" é recorte DECLARADO — e por isso a tela avisa que é recorte. Extração que
+# não se declara vira indistinguível de resumo, e resumir está fora por princípio:
+# resumir decide POR VOCÊ o que importou, e devolve esse juízo com a sua voz.
+DESTINATIONS = [
+    ("1", "E-mail", "enquadrar",
+     "Rewrite as an email. A subject line (\"Assunto:\", translated into the output language) "
+     "drawn from what was actually said, then the message itself. Include a greeting or a "
+     "sign-off ONLY if the person spoke one — otherwise leave them out entirely. Professional "
+     "register, spoken fillers gone, but keep the person's own wording where it works. "
+     "Never invent a recipient or sender name."),
+    ("2", "Mensagem (WhatsApp)", "enquadrar",
+     "Rewrite as a short message for a chat app. Direct, warm, line breaks between ideas, no "
+     "formal salutation. As short as the content allows without dropping anything that was said."),
+    ("3", "Devolutiva (feedback)", "enquadrar",
+     "Reorganise as feedback addressed to its recipient. Group into what works, what does not, "
+     "and what to do next — dropping any group the transcript has nothing for. Keep the "
+     "speaker's judgements exactly as strong or as soft as they were stated."),
+    ("4", "Lista de tarefas", "extrair",
+     "Extract what has to be done. Two lists, each omitted when empty: decisions taken, and open "
+     "items. One line per item, starting with a verb; owner and deadline only if spoken. This is "
+     "the ONLY destination allowed to drop conversational content that is neither a decision nor "
+     "an action. If the transcript holds no decision and no action, fall back to STEP 1 and "
+     "return it cleaned — never return an empty result."),
+    ("5", "Prompt pra uma IA", "enquadrar",
+     "Rewrite as an instruction for an AI: context, then task, then expected output format. Make "
+     "a vague spoken reference explicit ONLY when the transcript itself makes it explicit "
+     "somewhere; otherwise leave it as stated."),
+]
+
+
+def choose_destination() -> tuple | None:
+    """Menu de destino. ENTER = não formatar — o fluxo de quem só quer o literal
+    não pode ficar mais lento por causa desta feature."""
+    print("\n------------------------------------------------------------")
+    print("LEVAR ESSE TEXTO PRA ALGUM LUGAR?")
+    print("------------------------------------------------------------")
+    for key, label, operacao, _ in DESTINATIONS:
+        marca = "  (recorte)" if operacao == "extrair" else ""
+        print(f"  {key}. {label}{marca}")
+    print("  ENTER. não, ficar só com a transcrição")
+
+    while True:
+        flush_input_buffer()  # D24: toda pergunta limpa o buffer antes
+        answer = input("\nDestino: ").strip()
+
+        if answer == "":
+            return None
+
+        for item in DESTINATIONS:
+            if answer == item[0]:
+                return item
+
+        print(f'Não entendi "{answer}". Escolha um número de 1 a {len(DESTINATIONS)} ou ENTER.')
+
+
+def _ask(client: OpenAI, prompt: str) -> str:
+    response = client.chat.completions.create(
+        model=FORMAT_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,  # aqui fidelidade vale mais que variedade
+    )
+    return (response.choices[0].message.content or "").strip()
+
+
+def format_transcript(client: OpenAI, transcript: str, destino: tuple) -> tuple[str, bool]:
+    """Devolve (texto, aplicou_formato). Duas chamadas de propósito — ver a nota da v3:
+    um prompt só não consegue aplicar um formato e decidir não aplicá-lo ao mesmo tempo."""
+    _, label, _, bloco = destino
+    print(f"\nFormatando para: {label}...")
+
+    veredito = _ask(client, DECISION_PROMPT.format(rotulo=label, transcricao=transcript))
+    cabe = veredito.strip().upper().startswith("SIM")
+
+    if not cabe:
+        # devolve limpo, e DIZ que devolveu limpo — a v2 falhava calada, entregando
+        # um híbrido que parecia o formato pedido.
+        return _ask(client, CLEANUP_PROMPT.format(transcricao=transcript)), False
+
+    return _ask(client, FORMAT_FRAME.format(bloco=bloco, transcricao=transcript)), True
+
+
+def append_formatted(output_path: Path, label: str, texto: str):
+    """Anexa embaixo do literal, no MESMO arquivo. O literal fica em cima, sempre."""
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bloco = f"\n\n---\n\n## {label}\n\n*Formatado em {timestamp} · modelo {FORMAT_MODEL}*\n\n{texto}\n"
+    with open(output_path, "a", encoding="utf-8") as arquivo:
+        arquivo.write(bloco)
+
+
+def offer_formatting(client: OpenAI, transcript: str, output_path: Path):
+    """Roda DEPOIS de a transcrição estar salva, copiada e o áudio movido — assim
+    nenhuma falha aqui pode custar a transcrição, que é o produto principal."""
+    while True:
+        destino = choose_destination()
+        if destino is None:
+            return
+
+        _, label, operacao, _ = destino
+
+        try:
+            formatado, aplicou = format_transcript(client, transcript, destino)
+        except Exception as error:
+            print(f"\nNão consegui formatar: {type(error).__name__}: {error}")
+            print("A transcrição continua salva e intacta.")
+            if ask_yes_no("Tentar outro destino? [s/n]: "):
+                continue
+            return
+
+        if not formatado:
+            print("\nO modelo devolveu vazio. A transcrição continua salva e intacta.")
+            if ask_yes_no("Tentar outro destino? [s/n]: "):
+                continue
+            return
+
+        titulo = label.upper() if aplicou else f"{label.upper()} — SÓ LIMPO"
+        print("\n============================================================")
+        print(titulo)
+        print("============================================================\n")
+        print(formatado)
+        print("\n============================================================")
+        if not aplicou:
+            # "não coube" mentiria quando a fala JÁ servia como está (uma mensagem curta de
+            # WhatsApp, por exemplo). A frase descreve o desfecho, não julga a fala.
+            print("O formato não acrescentaria nada aqui — ou a fala já servia assim, ou não")
+            print("tinha conteúdo pro formato. Nos dois casos eu limpei em vez de encenar.")
+        if aplicou and operacao == "extrair":
+            print("Isto é um RECORTE — só o que virou item. O texto completo está acima e no .md.")
+
+        append_formatted(output_path, label if aplicou else f"{label} (só limpo)", formatado)
+        print(f"Anexado ao arquivo: {output_path.name}")
+
+        copy_to_clipboard(formatado)
+        print("(o clipboard agora tem o texto formatado, não mais a transcrição literal)")
+
+        if not ask_yes_no("\nQuer levar pra outro destino também? [s/n]: "):
+            return
 
 
 # =========================
